@@ -1,0 +1,187 @@
+parameters:
+- name: appSettingsPath
+  type: string
+  displayName: 'Caminho do appsettings.json'
+  
+- name: dockerfilePath
+  type: string
+  displayName: 'Caminho do Dockerfile'
+  
+- name: imageName
+  type: string
+  displayName: 'Nome da imagem Docker'
+  
+- name: hmlVariableGroup
+  type: string
+  displayName: 'Grupo de variáveis do ambiente HML'
+  
+- name: prdVariableGroup
+  type: string
+  displayName: 'Grupo de variáveis do ambiente PRD'
+  
+- name: environmentName
+  type: string
+  displayName: 'Nome do environment do Azure DevOps para PRD'
+
+- name: awsServiceConnection
+  type: string
+  default: 'aws-oidc-federation'
+  displayName: 'Nome da service connection AWS'
+
+- name: awsRegion
+  type: string
+  default: 'us-east-1'
+  displayName: 'Região AWS'
+
+- name: vmImage
+  type: string
+  default: 'ubuntu-latest'
+  displayName: 'Imagem da VM do agent'
+
+- name: tokenPrefix
+  type: string
+  default: '__@'
+  displayName: 'Prefixo dos tokens para replace'
+
+- name: tokenSuffix
+  type: string
+  default: '@__'
+  displayName: 'Sufixo dos tokens para replace'
+
+- name: dockerTag
+  type: string
+  default: 'latest'
+  displayName: 'Tag da imagem Docker'
+
+- name: ecrImageSource
+  type: string
+  default: 'imagename'
+  displayName: 'Fonte da imagem para ECR'
+
+stages:
+- stage: HML
+  displayName: 'Deploy HML'
+  variables:
+  - group: ${{ parameters.hmlVariableGroup }}
+  jobs:
+  - job: DeployHML
+    displayName: 'Deploy para HML'
+    pool:
+      vmImage: ${{ parameters.vmImage }}
+    steps:
+    - task: replacetokens@3
+      displayName: 'Replace tokens in appsettings'
+      inputs:
+        rootDirectory: ''
+        targetFiles: ${{ parameters.appSettingsPath }}
+        encoding: 'auto'
+        writeBOM: true
+        actionOnMissing: 'warn'
+        keepToken: false
+        tokenPrefix: ${{ parameters.tokenPrefix }}
+        tokenSuffix: ${{ parameters.tokenSuffix }}
+        useLegacyPattern: false
+        enableTelemetry: true
+
+    - task: Docker@1
+      displayName: 'Build Docker image'
+      inputs:
+        containerCommand: 'build'
+        Dockerfile: ${{ parameters.dockerfilePath }}
+        tags: ${{ parameters.dockerTag }}
+        imageName: ${{ parameters.imageName }}
+
+    - task: ECRPushImage@1
+      displayName: 'Push image to ECR'
+      inputs:
+        awsCredentials: ${{ parameters.awsServiceConnection }}
+        regionName: ${{ parameters.awsRegion }}
+        imageSource: ${{ parameters.ecrImageSource }}
+        sourceImageName: ${{ parameters.imageName }}
+        repositoryName: '$(repositoryName)'
+
+    - task: AWSShellScript@1
+      displayName: 'Get current task definition revision'
+      inputs:
+        awsCredentials: ${{ parameters.awsServiceConnection }}
+        regionName: ${{ parameters.awsRegion }}
+        scriptType: 'inline'
+        inlineScript: |
+          revision=$(aws ecs describe-task-definition --task-definition $(taskdef) --region ${{ parameters.awsRegion }} --query 'taskDefinition.{revision:revision}' | awk '{print $2}')
+          echo "##vso[task.setvariable variable=VERSIONAPI;]$(echo $revision)"
+
+    - task: AWSCLI@1
+      displayName: 'Update ECS service'
+      inputs:
+        awsCredentials: ${{ parameters.awsServiceConnection }}
+        regionName: ${{ parameters.awsRegion }}
+        awsCommand: 'ecs'
+        awsSubCommand: 'update-service'
+        awsArguments: '--cluster $(CLUSTERECS) --service $(SERVICENAMEMS) --task-definition $(taskdef):$(VERSIONAPI) --force-new-deployment'
+
+- stage: PRD
+  displayName: 'Deploy PRD'
+  dependsOn: HML
+  condition: succeeded()
+  variables:
+  - group: ${{ parameters.prdVariableGroup }}
+  jobs:
+  - deployment: DeployPRD
+    displayName: 'Deploy para PRD'
+    pool:
+      vmImage: ${{ parameters.vmImage }}
+    environment: ${{ parameters.environmentName }}
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          
+          - task: replacetokens@3
+            displayName: 'Replace tokens in appsettings'
+            inputs:
+              rootDirectory: ''
+              targetFiles: ${{ parameters.appSettingsPath }}
+              encoding: 'auto'
+              writeBOM: true
+              actionOnMissing: 'warn'
+              keepToken: false
+              tokenPrefix: ${{ parameters.tokenPrefix }}
+              tokenSuffix: ${{ parameters.tokenSuffix }}
+              useLegacyPattern: false
+              enableTelemetry: true
+
+          - task: Docker@1
+            displayName: 'Build Docker image'
+            inputs:
+              containerCommand: 'build'
+              Dockerfile: ${{ parameters.dockerfilePath }}
+              tags: ${{ parameters.dockerTag }}
+              imageName: ${{ parameters.imageName }}
+
+          - task: ECRPushImage@1
+            displayName: 'Push image to ECR'
+            inputs:
+              awsCredentials: ${{ parameters.awsServiceConnection }}
+              regionName: ${{ parameters.awsRegion }}
+              sourceImageName: ${{ parameters.imageName }}
+              repositoryName: $(repositoryName)
+
+          - task: AWSShellScript@1
+            displayName: 'Get current task definition revision'
+            inputs:
+              awsCredentials: ${{ parameters.awsServiceConnection }}
+              regionName: ${{ parameters.awsRegion }}
+              scriptType: 'inline'
+              inlineScript: |
+                revision=$(aws ecs describe-task-definition --task-definition $(taskdef) --region ${{ parameters.awsRegion }} --query 'taskDefinition.{revision:revision}' | awk '{print $2}')
+                echo "##vso[task.setvariable variable=VERSIONAPI;]$(echo $revision)"
+
+          - task: AWSCLI@1
+            displayName: 'Update ECS service'
+            inputs:
+              awsCredentials: ${{ parameters.awsServiceConnection }}
+              regionName: ${{ parameters.awsRegion }}
+              awsCommand: 'ecs'
+              awsSubCommand: 'update-service'
+              awsArguments: '--cluster $(CLUSTERECS) --service $(SERVICENAMEMS) --task-definition $(taskdef):$(VERSIONAPI) --force-new-deployment'
